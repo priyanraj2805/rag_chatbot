@@ -1,16 +1,26 @@
 """
-cache.py  -- optional Redis answer cache with version-based invalidation.
+cache.py  -- two-layer Redis answer cache with version-based invalidation.
 
-If REDIS_URL is set, identical questions (same question + filter) return a
-cached answer instantly instead of re-running retrieval + LLM. If Redis is not
-configured or unreachable, every method becomes a no-op so the app still works.
+LAYER 1  (exact cache)  --  key = hash(version + question)
+  Skips everything: Qdrant, reranker, AND LLM.
+  HIT condition: exact same question asked again.
+  Speed on hit: ~50ms.
 
-Version-based invalidation:
-  - A single integer key "rag:version" lives in Redis.
-  - Every cache key includes the current version number in its hash.
-  - When ingest runs, increment_version() bumps the version atomically.
-  - All old keys become unreachable instantly (wrong version in hash).
-  - Old keys expire naturally after 24h TTL — no manual deletion needed.
+LAYER 2  (LLM cache)  --  key = hash(version + question + chunk_ids)
+  Skips only the LLM. Qdrant + reranker still run every time.
+  HIT condition: Qdrant returns the same chunks for a similar question.
+  Speed on hit: ~400ms (Qdrant + reranker run, LLM skipped).
+
+VERSION-BASED INVALIDATION:
+  A single integer "rag:version" lives in Redis.
+  Both layer keys include the version.
+  When ingest runs → increment_version() bumps it atomically.
+  All old cached answers become unreachable instantly.
+  Old keys expire naturally after their TTL — no manual deletion needed.
+
+GRACEFUL DEGRADATION:
+  If Redis is not configured or unreachable, every method is a no-op.
+  The app works perfectly without Redis — just slower.
 """
 
 from __future__ import annotations
@@ -23,8 +33,8 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-_TTL_SECONDS = 60 * 60 * 24  # cache answers for 24 hours
-_VERSION_KEY = "rag:version"  # single integer key that tracks cache generation
+_TTL_SECONDS      = 60 * 60 * 24  # both layers: cache answers for 24 hours
+_VERSION_KEY      = "rag:version"  # single integer key tracking cache generation
 
 
 class AnswerCache:
@@ -34,10 +44,9 @@ class AnswerCache:
             return
         try:
             import redis
-
             self.client = redis.from_url(redis_url, decode_responses=True)
             self.client.ping()
-            logger.info("Redis cache enabled")
+            logger.info("Redis cache enabled (two-layer: exact + LLM)")
         except Exception as exc:  # noqa: BLE001
             logger.warning("Redis unavailable, caching disabled: %s", exc)
             self.client = None
@@ -57,47 +66,119 @@ class AnswerCache:
         """
         Bump the cache version by 1. Called after every ingest.
         Redis INCR is atomic — safe even if two ingests run simultaneously.
+        Both Layer 1 and Layer 2 keys include version — both invalidated at once.
         Returns the new version number.
         """
         if not self.client:
             return 1
         try:
             new_version = self.client.incr(_VERSION_KEY)
-            logger.info("Cache version bumped to %d — all previous answers invalidated", new_version)
+            logger.info(
+                "Cache version bumped to %d — all Layer 1 + Layer 2 answers invalidated",
+                new_version,
+            )
             return new_version
         except Exception:  # noqa: BLE001
             return 1
 
-    # ── key generation ────────────────────────────────────────────────────────
+    # ── key builders ──────────────────────────────────────────────────────────
 
-    def _key(self, question: str, source_url: str | None) -> str:
+    def _layer1_key(self, question: str, source_url: str | None) -> str:
         """
-        Build a Redis key that includes the current version number.
-        When the version changes, this produces a completely different hash,
-        making all old cached answers unreachable without deleting anything.
+        LAYER 1 key — based on version + question only.
+        Changes when: version bumps (ingest ran).
+        Prefix: rag:answer:
         """
         version = self.get_version()
         raw = f"v{version}|{question.strip().lower()}|{source_url or ''}"
         return "rag:answer:" + hashlib.sha256(raw.encode()).hexdigest()
 
-    # ── cache read / write ────────────────────────────────────────────────────
+    def _layer2_key(self, question: str, chunk_ids: list[str], source_url: str | None) -> str:
+        """
+        LAYER 2 key — based on version + question + chunk IDs returned by Qdrant.
+        Changes when: version bumps OR Qdrant returns different chunks.
+        Including chunk IDs ensures the cached LLM answer matches the
+        exact context that was used to generate it.
+        Prefix: rag:llm:
+        """
+        version = self.get_version()
+        # Sort chunk IDs so order doesn't matter — same set = same key.
+        chunks_part = "|".join(sorted(chunk_ids))
+        raw = f"v{version}|{question.strip().lower()}|{source_url or ''}|{chunks_part}"
+        return "rag:llm:" + hashlib.sha256(raw.encode()).hexdigest()
+
+    # ── LAYER 1: exact cache (question only) ──────────────────────────────────
 
     def get(self, question: str, source_url: str | None) -> dict | None:
+        """Layer 1 read — check before Qdrant. Skips everything on hit."""
         if not self.client:
             return None
         try:
-            raw = self.client.get(self._key(question, source_url))
+            raw = self.client.get(self._layer1_key(question, source_url))
+            if raw:
+                logger.debug("Layer 1 cache HIT for: %s", question[:60])
             return json.loads(raw) if raw else None
         except Exception:  # noqa: BLE001
             return None
 
     def set(self, question: str, source_url: str | None, payload: dict) -> None:
+        """Layer 1 write — store after full RAG pipeline completes."""
         if not self.client:
             return
         try:
             self.client.setex(
-                self._key(question, source_url), _TTL_SECONDS, json.dumps(payload)
+                self._layer1_key(question, source_url),
+                _TTL_SECONDS,
+                json.dumps(payload),
             )
+            logger.debug("Layer 1 cache SET for: %s", question[:60])
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ── LAYER 2: LLM cache (question + chunk IDs) ─────────────────────────────
+
+    def get_llm(
+        self,
+        question: str,
+        chunk_ids: list[str],
+        source_url: str | None = None,
+    ) -> dict | None:
+        """
+        Layer 2 read — check AFTER Qdrant but BEFORE LLM.
+        Returns cached answer if same question retrieved same chunks before.
+        Skips only the LLM on hit (~800ms saved).
+        """
+        if not self.client:
+            return None
+        try:
+            raw = self.client.get(self._layer2_key(question, chunk_ids, source_url))
+            if raw:
+                logger.info("Layer 2 (LLM) cache HIT for: %s", question[:60])
+            return json.loads(raw) if raw else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def set_llm(
+        self,
+        question: str,
+        chunk_ids: list[str],
+        payload: dict,
+        source_url: str | None = None,
+    ) -> None:
+        """
+        Layer 2 write — store the LLM answer keyed by question + chunk IDs.
+        Called after LLM generates answer, so next time same chunks appear
+        the LLM call is skipped entirely.
+        """
+        if not self.client:
+            return
+        try:
+            self.client.setex(
+                self._layer2_key(question, chunk_ids, source_url),
+                _TTL_SECONDS,
+                json.dumps(payload),
+            )
+            logger.debug("Layer 2 (LLM) cache SET for: %s", question[:60])
         except Exception:  # noqa: BLE001
             pass
 

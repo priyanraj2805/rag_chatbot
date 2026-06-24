@@ -274,7 +274,7 @@ class RAGPipeline:
         # 2. Rewrite vague queries before retrieval.
         retrieval_query = self._rewrite_query(question)
 
-        # 3. RAG: retrieve relevant chunks using the rewritten query.
+        # 3. Qdrant + reranker — always runs (fresh results every time).
         chunks = self._retrieve(retrieval_query, top_k, source_url)
         if not chunks:
             return Answer(
@@ -286,10 +286,24 @@ class RAGPipeline:
                 sources=[],
             )
 
-        # 3. Build grounded prompt and call the LLM.
+        # 4. LAYER 2 CACHE CHECK — between reranker and LLM.
+        # If the same question retrieved the same chunks before, we already have
+        # the LLM answer stored in Redis. Skip the LLM call entirely.
+        chunk_ids = [c.id for c in chunks]
+        sources = self._sources_payload(chunks)
+        cached_llm = cache.get_llm(question, chunk_ids, source_url)
+        if cached_llm:
+            logger.info("Layer 2 hit — LLM skipped for: %s", question[:60])
+            return Answer(answer=cached_llm["answer"], sources=cached_llm["sources"])
+
+        # 5. LLM — only runs when both Layer 1 and Layer 2 miss.
         messages = build_messages(question, chunks)
         text = self.llm.generate(messages)
-        return Answer(answer=text, sources=self._sources_payload(chunks))
+
+        # 6. Store in Layer 2 so next time same chunks appear, LLM is skipped.
+        cache.set_llm(question, chunk_ids, {"answer": text, "sources": sources}, source_url)
+
+        return Answer(answer=text, sources=sources)
 
     def answer_stream(
         self,
@@ -307,7 +321,7 @@ class RAGPipeline:
         # 2. Rewrite vague queries before retrieval.
         retrieval_query = self._rewrite_query(question)
 
-        # 3. RAG retrieve using the rewritten query.
+        # 3. Qdrant + reranker — always runs (fresh results every time).
         chunks = self._retrieve(retrieval_query, top_k, source_url)
         if not chunks:
             def _no_index() -> Iterator[str]:
@@ -318,9 +332,36 @@ class RAGPipeline:
                 )
             return _no_index(), []
 
-        # 3. Stream grounded answer.
+        # 4. LAYER 2 CACHE CHECK — between reranker and LLM.
+        # If Qdrant returned the same chunks as before, return the cached LLM
+        # answer as a single-yield iterator. LLM never called.
+        chunk_ids = [c.id for c in chunks]
+        sources = self._sources_payload(chunks)
+        cached_llm = cache.get_llm(question, chunk_ids, source_url)
+        if cached_llm:
+            logger.info("Layer 2 hit (stream) — LLM skipped for: %s", question[:60])
+            def _cached_stream() -> Iterator[str]:
+                yield cached_llm["answer"]
+            return _cached_stream(), cached_llm["sources"]
+
+        # 5. LLM stream — only runs when both layers miss.
+        # Wrap the token stream: yields each token to frontend AND collects
+        # all tokens so the complete answer can be stored in Layer 2 cache.
         messages = build_messages(question, chunks)
-        return self.llm.stream(messages), self._sources_payload(chunks)
+
+        def _stream_and_cache() -> Iterator[str]:
+            full: list[str] = []
+            for token in self.llm.stream(messages):
+                full.append(token)
+                yield token  # send token to frontend immediately
+            # streaming done — store complete answer in Layer 2
+            cache.set_llm(
+                question, chunk_ids,
+                {"answer": "".join(full), "sources": sources},
+                source_url,
+            )
+
+        return _stream_and_cache(), sources
 
 
 @lru_cache

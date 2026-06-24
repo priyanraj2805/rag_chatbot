@@ -1,255 +1,333 @@
-# DotStark RAG Chatbot — Architecture Diagram
+# DotStark RAG Chatbot — High Level Architecture
 
-## Full System Architecture
+---
+
+## Complete System Architecture
 
 ```
-┌──────────────────────────────────────────────────���──────────────────────────┐
-│                              BROWSER (User)                                 │
-│                         http://localhost:5173                               │
-└─────────────────────────┬───────────────────────────────────────────────────┘
-                          │ HTTP / SSE
-                          ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        FRONTEND  (React + Vite)                             │
-│                                                                             │
-│   App.jsx                                                                   │
-│   └── ChatWidget.jsx          ← chat UI, SSE token streaming, sources      │
-│       └── api.js              ← getStatus() | streamChat() SSE parser      │
-│                                                                             │
-│   vite.config.js  →  proxy  /api  →  http://localhost:8000                 │
-└─────────────────────────┬───────────────────────────────────────────────────┘
-                          │ /api/chat/stream  (POST)
-                          │ /api/status       (GET)
-                          ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        BACKEND  (FastAPI + Python)                          │
-│                                                                             │
-│  main.py  ──────────────────────────────────────────────────────────────   │
-│  │  startup event → background thread → auto-ingest dotstark.com           │
-│  │                                                                          │
-│  └── api/routes.py  (HTTP layer)                                            │
-│      ├── GET  /api/health                                                   │
-│      ├── GET  /api/status                                                   │
-│      ├── POST /api/ingest                                                   │
-│      ├── POST /api/chat          ← blocking                                 │
-│      └── POST /api/chat/stream   ← Server-Sent Events (SSE)                │
-│              │                                                              │
-│              │  Step 1: Check Redis cache                                   │
-│              ▼                                                              │
-│  ┌─────────────────────┐   HIT  ┌──────────────────────────────────┐       │
-│  │   cache.py          │───────▶│  Return cached answer instantly   │       │
-│  │  (Redis exact match)│        │  (no Qdrant, no LLM call)        │       │
-│  │  SHA-256 key        │        └──────────────────────────────────┘       │
-│  │  TTL = 24 hours     │                                                    │
-│  └─────────┬───────────┘                                                   │
-│            │ MISS                                                           │
-│            ▼                                                                │
-│  ┌─────────────────────────────────────────────────────────────┐           │
-│  │                    rag/pipeline.py                          │           │
-│  │                   (RAGPipeline)                             │           │
-│  │                                                             │           │
-│  │   ┌─────────────────────────────────────────────────────┐  │           │
-│  │   │              QUERY FLOW                             │  │           │
-│  │   │                                                     │  │           │
-│  │   │  question                                           │  │           │
-│  │   │      │                                              │  │           │
-│  │   │      ▼                                              │  │           │
-│  │   │  chitchat check ──── YES ──▶ LLM (no retrieval)    │  │           │
-│  │   │      │ NO                                           │  │           │
-│  │   │      ▼                                              │  │           │
-│  │   │  embeddings/embedder.py                             │  │           │
-│  │   │  (question → 384-dim vector)                        │  │           │
-│  │   │      │                                              │  │           │
-│  │   │      ▼                                              │  │           │
-│  │   │  retrieval/retriever.py                             │  │           │
-│  │   │  ├── Dense Search  → Qdrant vector similarity       │  │           │
-│  │   │  ├── Sparse Search → BM25 keyword search            │  │           │
-│  │   │  ├── RRF Fusion    → merge both ranked lists        │  │           │
-│  │   │  └── Reranker      → cross-encoder precision sort   │  │           │
-│  │   │      │  top 5 chunks                                │  │           │
-│  │   │      ▼                                              │  │           │
-│  │   │  llm/prompts.py                                     │  │           │
-│  │   │  (build system + context + question messages)       │  │           │
-│  │   │      │                                              │  │           │
-│  │   │      ▼                                              │  │           │
-│  │   │  llm/client.py  →  Groq API  (stream tokens)        │  │           │
-│  │   │      │                                              │  │           │
-│  │   │      ▼                                              │  │           │
-│  │   │  cache.py  →  Redis SAVE (24h TTL)                  │  │           │
-│  │   └─────────────────────────────────────────────────────┘  │           │
-│  │                                                             │           │
-│  │   ┌─────────────────────────────────────────────────────┐  │           │
-│  │   │              INGESTION FLOW                         │  │           │
-│  │   │                                                     │  │           │
-│  │   │  dotstark.com URL                                   │  │           │
-│  │   │      │                                              │  │           │
-│  │   │      ▼                                              │  │           │
-│  │   │  crawler/fetcher.py   → HTTP GET raw HTML           │  │           │
-│  │   │      │                                              │  │           │
-│  │   │      ▼                                              │  │           │
-│  │   │  crawler/extractor.py → HTML → plain text + links   │  │           │
-│  │   │      │                                              │  │           │
-│  │   │      ▼                                              │  │           │
-│  │   │  crawler/crawler.py   → BFS + sitemap + robots.txt  │  │           │
-│  │   │      │  list of CrawledPage objects                 │  │           │
-│  │   │      ▼                                              │  │           │
-│  │   │  processing/cleaner.py → remove boilerplate/noise   │  │           │
-│  │   │      │                                              │  │           │
-│  │   │      ▼                                              │  │           │
-│  │   │  processing/chunker.py → 800-char sliding window    │  │           │
-│  │   │      │  list of Chunk objects                       │  │           │
-│  │   │      ▼                                              │  │           │
-│  │   │  embeddings/embedder.py → text → 384-dim vectors    │  │           │
-│  │   │      │                                              │  │           │
-│  │   │      ▼                                              │  │           │
-│  │   │  vectorstore/qdrant_store.py → upsert to Qdrant     │  │           │
-│  │   └─────────────────────────────────────────────────────┘  │           │
-│  └─────────────────────────────────────────────────────────────┘           │
-│                                                                             │
-│  config.py  ←  .env  (API keys, model names, feature flags)                │
-│  schemas.py ←  Pydantic models (ChatRequest, ChatResponse, etc.)           │
-└──────────────────────┬──────────────────────┬──────────────────────────────┘
-                       │                      │
-                       ▼                      ▼
-        ┌──────────────────────┐   ┌─────────────────────┐
-        │   Qdrant Cloud       │   │   Redis Cloud        │
-        │  (Vector Database)   │   │  (Answer Cache)      │
-        │                      │   │                      │
-        │  • stores chunk      │   │  • key: SHA-256 of   │
-        │    vectors (384-dim) │   │    question          │
-        │  • cosine similarity │   │  • value: answer +   │
-        │    search (HNSW)     │   │    sources JSON      │
-        │  • metadata filter   │   │  • TTL: 24 hours     │
-        │    by source_url     │   │  • ~5 KB per entry   │
-        └──────────────────────┘   └─────────────────────┘
-                       │
-                       ▼
-        ┌──────────────────────┐
-        │   Groq API           │
-        │  (LLM Provider)      │
-        │                      │
-        │  • llama-3.3-70b     │
-        │  • streaming tokens  │
-        │  • temp = 0.1        │
-        └──────────────────────┘
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║                              USER'S BROWSER                                      ║
+║                                                                                  ║
+║   ┌─────────────────────────────────────────────────────────────────────────┐   ║
+║   │                      React Chat Widget                                   │   ║
+║   │                                                                           │   ║
+║   │   ┌─────────────────────────┐    ┌──────────────────────────────────┐   │   ║
+║   │   │      Chat Tab           │    │       Index a Website Tab         │   │   ║
+║   │   │  - Type question        │    │  - Paste any URL                  │   │   ║
+║   │   │  - See streaming answer │    │  - Click Start Indexing           │   │   ║
+║   │   │  - See source citations │    │  - Progress shown in real time    │   │   ║
+║   │   │  - Markdown rendered    │    └──────────────────────────────────┘   │   ║
+║   │   └─────────────────────────┘                                            │   ║
+║   └──────────────────────────────────┬──────────────────────────────────────┘   ║
+╚═════════════════════════════════════╪════════════════════════════════════════════╝
+                                      │
+                          HTTP + SSE (streaming)
+                                      │
+╔═════════════════════════════════════▼════════════════════════════════════════════╗
+║                            FastAPI Backend                                        ║
+║                                                                                   ║
+║   ┌──────────────────┐  ┌──────────────────┐  ┌────────────────────────────┐   ║
+║   │  POST /chat      │  │ POST /chat/stream │  │      POST /ingest          │   ║
+║   │  (full response) │  │ (SSE streaming)  │  │  (crawl + index website)   │   ║
+║   └────────┬─────────┘  └────────┬─────────┘  └─────────────┬──────────────┘   ║
+║            │                     │                            │                   ║
+║            └──────────┬──────────┘                           │                   ║
+║                       │                                       │                   ║
+║          ┌────────────▼──────────────────┐     ┌────────────▼──────────────┐   ║
+║          │         QUERY PIPELINE         │     │      INGESTION PIPELINE    │   ║
+║          └────────────────────────────────┘     └───────────────────────────┘   ║
+╚════════════════════════════════════════════════════════════════════════════════════╝
 ```
 
 ---
 
-## Layer Responsibilities
+## Ingestion Pipeline  (runs when you index a website)
 
 ```
-┌─────────────────┬────────────────────────┬──────────────────────────────┐
-│ Layer           │ File                   │ Single Responsibility        │
-├─────────────────┼────────────────────────┼──────────────────────────────┤
-│ HTTP            │ api/routes.py          │ Request/response only        │
-│ Pipeline        │ rag/pipeline.py        │ Wire all layers together     │
-│ Cache           │ cache.py               │ Redis read/write only        │
-│ Network         │ crawler/fetcher.py     │ HTTP GET only                │
-│ HTML Parsing    │ crawler/extractor.py   │ HTML → text + links only     │
-│ Crawling        │ crawler/crawler.py     │ BFS + sitemap + robots only  │
-│ Text Cleaning   │ processing/cleaner.py  │ Normalize text only          │
-│ Chunking        │ processing/chunker.py  │ Split text only              │
-│ Embedding       │ embeddings/embedder.py │ Text → vector only           │
-│ Vector Store    │ vectorstore/qdrant_store│ Store + search vectors only │
-│ Retrieval       │ retrieval/retriever.py │ Find relevant chunks only    │
-│ Reranking       │ retrieval/reranker.py  │ Precision scoring only       │
-│ LLM Client      │ llm/client.py          │ API calls only               │
-│ Prompt Building │ llm/prompts.py         │ Message construction only    │
-│ Config          │ config.py              │ Settings from .env only      │
-│ Schemas         │ schemas.py             │ Data validation only         │
-└─────────────────┴────────────────────────┴──────────────────────────────┘
-```
-
----
-
-## Query Flow (step by step)
-
-```
-User types: "What services does DotStark offer?"
-        │
-        ▼
-[1] frontend/api.js
-        POST /api/chat/stream
-
-        ▼
-[2] api/routes.py  →  chat_stream()
-        │
-        ├─ cache.get("what services does dotstark offer?")
-        │       │
-        │       ├── HIT  → stream cached answer → DONE (fast path)
-        │       │
-        │       └── MISS → continue to RAG pipeline
-        ▼
-[3] rag/pipeline.py  →  answer_stream()
-        │
-        ├─ is_chitchat("what services...") → NO
-        │
-        ▼
-[4] embeddings/embedder.py
-        "Represent this sentence for searching relevant passages: What services..."
-        → [0.021, -0.043, 0.117, ... ]  (384 numbers)
-
-        ▼
-[5] retrieval/retriever.py
-        ├─ Dense:  Qdrant cosine search  → top 20 chunks by meaning
-        ├─ Sparse: BM25 keyword search   → top 20 chunks by keywords
-        └─ RRF:    fuse both lists       → top 20 combined candidates
-
-        ▼
-[6] retrieval/reranker.py
-        cross-encoder scores each (question, chunk) pair
-        → top 5 most relevant chunks
-
-        ▼
-[7] llm/prompts.py
-        system prompt + "[1] (Source: ...) chunk text..." + question
-
-        ▼
-[8] llm/client.py  →  Groq API
-        streams tokens: "DotStark", " offers", " web", " development", ...
-
-        ▼
-[9] api/routes.py
-        SSE events: sources → token → token → ... → done
-
-        ▼
-[10] cache.py  →  Redis SETEX (24h)
-        key:   SHA256("what services does dotstark offer?|")
-        value: {"answer": "DotStark offers...", "sources": [...]}
-
-        ▼
-[11] frontend/ChatWidget.jsx
-        renders tokens one by one (typewriter effect)
+  URL INPUT
+  (e.g. https://dotstark.com)
+         │
+         ▼
+┌────────────────────────────────────────────────────────────┐
+│                        WEB CRAWLER                          │
+│                                                             │
+│  • Reads robots.txt  →  respects blocked pages             │
+│  • Reads sitemap.xml →  discovers all pages instantly      │
+│  • BFS crawl with 0.5s delay between requests              │
+│  • Skips pages with less than 20 words                     │
+│  • Returns: URL + page title + raw HTML text               │
+└─────────────────────────────┬──────────────────────────────┘
+                              │  up to 120 pages
+                              ▼
+┌────────────────────────────────────────────────────────────┐
+│                       TEXT CLEANER                          │
+│                                                             │
+│  • Unicode normalization (NFKC standard)                   │
+│  • Removes control characters and invisible chars          │
+│  • Strips boilerplate: cookie banners, nav menus,          │
+│    footer text, copyright notices                          │
+│  • Collapses multiple blank lines into one                 │
+│  • Returns: clean plain text                               │
+└─────────────────────────────┬──────────────────────────────┘
+                              │  clean text
+                              ▼
+┌────────────────────────────────────────────────────────────┐
+│                       TEXT CHUNKER                          │
+│                                                             │
+│  • Sentence-aware sliding window algorithm                 │
+│  • Chunk size: 800 characters                              │
+│  • Overlap:    150 characters (context continuity)         │
+│  • Never cuts a sentence in the middle                     │
+│  • Splits on . ! ? and paragraph breaks                    │
+│  • Returns: list of text chunks with index numbers         │
+└─────────────────────────────┬──────────────────────────────┘
+                              │  ~60 chunks per page
+                              ▼
+┌────────────────────────────────────────────────────────────┐
+│                     EMBEDDING MODEL                         │
+│                      bge-small-en-v1.5                      │
+│                                                             │
+│  • Runs locally on your machine (free, no API cost)        │
+│  • Converts each chunk into a 384-number vector            │
+│  • Each number captures semantic meaning of the text       │
+│  • L2-normalized (all vectors on same scale)               │
+│  • Document prefix added before embedding                  │
+│  • Returns: 384-dimensional float vectors                  │
+└─────────────────────────────┬──────────────────────────────┘
+                              │  vectors + metadata
+                              ▼
+┌────────────────────────────────────────────────────────────┐
+│                      QDRANT CLOUD                           │
+│                     (Vector Database)                       │
+│                                                             │
+│  • Stores each chunk as: vector + text + URL + title       │
+│  • Index type: HNSW (fast approximate search)              │
+│  • Distance metric: Cosine similarity                      │
+│  • dotstark.com: 113 pages → 6,767 chunks stored           │
+└────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+              ┌───────────────────────────┐
+              │   Cache Version Bumped    │
+              │   BM25 Index Invalidated  │
+              │   (both happen after      │
+              │    every ingest)          │
+              └───────────────────────────┘
 ```
 
 ---
 
-## Ingestion Flow (on startup, runs once in background)
+## Query Pipeline  (runs on every user question)
 
 ```
-dotstark.com
-        │
-        ▼
-[1] crawler/fetcher.py    HTTP GET each page (browser User-Agent)
-        ▼
-[2] crawler/extractor.py  strip <script> <nav> <footer> → plain text
-        ▼
-[3] crawler/crawler.py    BFS queue, sitemap.xml seed, robots.txt check
-        │  120 pages crawled
-        ▼
-[4] processing/cleaner.py  normalize unicode, remove "Accept cookies" etc.
-        ▼
-[5] processing/chunker.py  sentence-aware sliding window
-        │  800 chars per chunk, 150 char overlap
-        ▼
-[6] embeddings/embedder.py  batch encode (32 at a time)
-        │  shape: (N, 384) float32 vectors
-        ▼
-[7] vectorstore/qdrant_store.py  upsert points with payload
-        │  {text, source_url, title, chunk_index}
-        ▼
-Qdrant Cloud  →  HNSW index built automatically
+  USER QUESTION
+  e.g. "what azure services does dotstark offer?"
+         │
+         ▼
+┌────────────────────────────────────────────────────────────┐
+│                    GREETING DETECTOR                        │
+│                                                             │
+│  Regex check for: hi, hello, hey, thanks, bye,             │
+│  how are you, who are you, what can you do, etc.           │
+│                                                             │
+│  MATCH  →  skip entire RAG pipeline                        │
+│            send directly to LLM with friendly prompt       │
+│  NO MATCH  →  continue                                     │
+└─────────────────────────────┬──────────────────────────────┘
+                              │  not a greeting
+                              ▼
+┌────────────────────────────────────────────────────────────┐
+│                     QUERY REWRITER                          │
+│                                                             │
+│  GUARD 1 — Vague pronoun check:                            │
+│    "what do they offer?"     →  has "they" → rewrite       │
+│    "what does dotstark offer?" →  no pronoun → SKIP        │
+│    Saves ~600ms on 90% of questions                        │
+│                                                             │
+│  GUARD 2 — In-memory rewrite cache:                        │
+│    Same vague question asked before → return instantly     │
+│                                                             │
+│  IF rewrite needed:                                        │
+│    LLM call: "when was it founded?"                        │
+│           →  "When was DotStark founded?"                  │
+└─────────────────────────────┬──────────────────────────────┘
+                              │  (possibly rewritten) query
+                              ▼
+┌────────────────────────────────────────────────────────────┐
+│                   REDIS — LAYER 1                           │
+│                   Exact Question Cache                      │
+│                                                             │
+│  Key = hash ( version + question )                         │
+│                                                             │
+│  HIT  →  return full answer instantly                      │
+│           nothing else runs              ✅  ~50ms          │
+│                                                             │
+│  MISS →  continue to retrieval                             │
+└─────────────────────────────┬──────────────────────────────┘
+                              │  Layer 1 miss
+                              ▼
+┌────────────────────────────────────────────────────────────┐
+│                    DENSE SEARCH                             │
+│                    (Semantic / Vector)                      │
+│                                                             │
+│  • Query embedded with bge-small (query prefix added)      │
+│  • HNSW search in Qdrant Cloud                             │
+│  • Finds chunks with most similar MEANING                  │
+│  • "car" matches "automobile" — synonym aware              │
+│  • Returns: top 10 candidates by cosine score              │
+│  • Network call: ~250ms                                    │
+└──────────────────┬──────────────────────────────────────────┘
+                   │
+                   │   +  (when hybrid search enabled)
+                   │
+┌──────────────────▼──────────────────────────────────────────┐
+│                    SPARSE SEARCH                             │
+│                    (BM25 Keyword)                            │
+│                                                             │
+│  • Tokenizes query into individual words                   │
+│  • Scores all chunks by TF-IDF keyword frequency           │
+│  • Finds chunks containing exact search terms              │
+│  • "manoj sharma" matches chunk with just "manoj"          │
+│  • Returns: top 10 candidates by keyword score             │
+│  • In-memory: ~10ms                                        │
+└─────────────────────────────┬──────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────┐
+│                     RRF FUSION                              │
+│             Reciprocal Rank Fusion  (k=60)                 │
+│                                                             │
+│  • Merges dense + sparse result lists into one             │
+│  • Score = 1/(60 + rank) from each list                    │
+│  • Chunks ranked high in EITHER list rise to top           │
+│  • Best of semantic meaning + exact keyword match          │
+│  • Returns: unified ranked list of top candidates          │
+└─────────────────────────────┬──────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────┐
+│                      RERANKER                               │
+│               Cross-Encoder (ms-marco-MiniLM)              │
+│                                                             │
+│  • Reads question AND chunk TOGETHER (more accurate)       │
+│  • Scores each (question, chunk) pair as a unit            │
+│  • Unlike embeddings which read them separately            │
+│  • Candidate pool: 10 chunks in, top 5 out                 │
+│  • Runs on CPU: ~250ms                                     │
+│  • Returns: final top 5 most relevant chunks               │
+└─────────────────────────────┬──────────────────────────────┘
+                              │  top 5 chunks
+                              ▼
+┌────────────────────────────────────────────────────────────┐
+│                   REDIS — LAYER 2                           │
+│                   LLM Cache                                 │
+│                                                             │
+│  Key = hash ( version + question + chunk_id_1              │
+│               + chunk_id_2 + chunk_id_3 ... )              │
+│                                                             │
+│  WHY chunk IDs in key?                                     │
+│  LLM answer depends entirely on the chunks fed to it.      │
+│  Same chunks = same answer → safe to cache.                │
+│  Different chunks = different answer → cache MISS.         │
+│                                                             │
+│  HIT  →  return cached LLM answer                         │
+│           LLM never called              ✅  ~600ms total    │
+│                                                             │
+│  MISS →  continue to LLM                                  │
+└─────────────────────────────┬──────────────────────────────┘
+                              │  Layer 2 miss
+                              ▼
+┌────────────────────────────────────────────────────────────┐
+│                         LLM                                 │
+│               Groq API — LLaMA 3.3 70B Versatile           │
+│                                                             │
+│  • System prompt: "answer only from the context below"     │
+│  • Context: top 5 reranked chunks injected                 │
+│  • Temperature: 0.1 (focused, not creative)                │
+│  • Output: streams tokens one by one via SSE               │
+│  • ~800ms to first token                                   │
+└─────────────────────────────┬──────────────────────────────┘
+                              │  token stream
+                              ▼
+┌────────────────────────────────────────────────────────────┐
+│               STREAM AND CACHE SIMULTANEOUSLY               │
+│                                                             │
+│  Token arrives from Groq                                   │
+│       │                                                     │
+│       ├──→  sent to frontend immediately (user sees it)    │
+│       └──→  appended to full answer list (collected)       │
+│                                                             │
+│  After last token:                                         │
+│       ├──→  full answer stored in Redis Layer 2            │
+│       └──→  full answer stored in Redis Layer 1            │
+└─────────────────────────────┬──────────────────────────────┘
+                              │
+                              ▼
+                     ANSWER TO USER
+                    (~1400ms first time)
+```
+
+---
+
+## Redis Cache — Version Invalidation
+
+```
+  NORMAL OPERATION
+  ─────────────────
+  rag:version = 1
+
+  Layer 1 key = hash("v1 | question")
+  Layer 2 key = hash("v1 | question | chunk_ids")
+
+  Both layers serve cached answers normally.
+
+
+  INGEST RUNS  (new pages added to Qdrant)
+  ──────────────────────────────────────────
+  Redis INCR "rag:version"
+       │
+       ▼
+  rag:version = 2   ← atomic, instant, O(1)
+
+  Layer 1 key = hash("v2 | question")        ← NEW key, old answer unreachable
+  Layer 2 key = hash("v2 | question | chunks") ← NEW key, old answer unreachable
+
+  Old v1 keys → still in Redis but NEVER read again
+              → expire naturally after 24 hours TTL
+              → no manual deletion needed
+```
+
+---
+
+## Response Time at Each Cache Layer
+
+```
+  Question arrives
+       │
+  ┌────▼──────────────────────────────────────────┐
+  │ Layer 1 HIT                                    │──→  ~50ms   ✅
+  │ (exact same question cached)                   │
+  └────┬──────────────────────────────────────────┘
+       │ MISS
+  ┌────▼──────────────────────────────────────────┐
+  │ Qdrant Search + BM25 + RRF + Reranker          │  ~550ms
+  └────┬──────────────────────────────────────────┘
+       │
+  ┌────▼──────────────────────────────────────────┐
+  │ Layer 2 HIT                                    │──→  ~600ms  ✅
+  │ (same chunks retrieved, LLM skipped)           │
+  └────┬──────────────────────────────────────────┘
+       │ MISS
+  ┌────▼──────────────────────────────────────────┐
+  │ LLM (Groq — LLaMA 3.3 70B)                    │  ~800ms
+  └────┬──────────────────────────────────────────┘
+       │
+  ┌────▼──────────────────────────────────────────┐
+  │ Store in Layer 2 + Layer 1                     │
+  └────┬──────────────────────────────────────────┘
+       │
+       ▼
+  Answer to user                                      ~1400ms
 ```
 
 ---
@@ -257,12 +335,30 @@ Qdrant Cloud  →  HNSW index built automatically
 ## External Services
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  Service         │  Purpose           │  When used       │
-├──────────────────┼────────────────────┼──────────────────┤
-│  Qdrant Cloud    │  Vector storage    │  Ingest + Query  │
-│  Redis Cloud     │  Answer cache      │  Every query     │
-│  Groq API        │  LLM inference     │  Cache miss only │
-│  dotstark.com    │  Content source    │  Ingestion only  │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────┐   ┌─────────────────┐   ┌─────────────────┐
+│   Qdrant Cloud  │   │   Groq API      │   │  Redis Cloud    │
+│                 │   │                 │   │                 │
+│  Vector storage │   │  LLM inference  │   │  Answer cache   │
+│  6,767 chunks   │   │  LLaMA 3.3 70B  │   │  Two layers     │
+│  HNSW index     │   │  Free tier      │   │  24h TTL        │
+│  Cosine metric  │   │  Streaming      │   │  Version-based  │
+│  Free tier      │   │  ~800ms         │   │  invalidation   │
+└─────────────────┘   └─────────────────┘   └─────────────────┘
+```
+
+---
+
+## Technology Stack
+
+```
+  Frontend    →  React + Vite           (chat widget, SSE streaming)
+  Backend     →  FastAPI + Python       (REST API, SSE endpoints)
+  Embeddings  →  bge-small-en-v1.5     (local, free, 384-dim vectors)
+  Vector DB   →  Qdrant Cloud          (HNSW, cosine, free tier)
+  Keywords    →  BM25 (rank-bm25)      (in-memory, exact term matching)
+  Reranker    →  ms-marco-MiniLM       (cross-encoder, runs on CPU)
+  LLM         →  Groq + LLaMA 3.3 70B (free API, fastest inference)
+  Cache L1    →  Redis (exact match)   (~50ms on hit)
+  Cache L2    →  Redis (chunk IDs)     (~600ms on hit, LLM skipped)
+  Scraping    →  requests + BS4        (no headless browser needed)
 ```

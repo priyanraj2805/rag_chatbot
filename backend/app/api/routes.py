@@ -75,12 +75,15 @@ def ingest(req: IngestRequest) -> IngestResponse:
 
 @router.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest) -> ChatResponse:
-    # 1. Cache hit?
+    # ── LAYER 1 CHECK: exact question match (skips Qdrant + reranker + LLM) ──
     cached = cache.get(req.question, req.source_url)
     if cached:
+        logger.info("Layer 1 HIT for: %s", req.question[:60])
         return ChatResponse(**cached, cached=True)
 
-    # 2. Run the RAG query pipeline.
+    # ── LAYER 1 MISS: run pipeline (Qdrant + reranker + Layer 2 check + LLM) ─
+    # Layer 2 check (question + chunk IDs) happens inside pipe.answer().
+    # If Layer 2 hits, LLM is skipped inside the pipeline automatically.
     pipe = get_pipeline()
     try:
         result = pipe.answer(req.question, top_k=req.top_k, source_url=req.source_url)
@@ -88,6 +91,7 @@ def chat(req: ChatRequest) -> ChatResponse:
         logger.exception("Chat failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    # Store in Layer 1 so exact same question is instant next time.
     payload = {"answer": result.answer, "sources": result.sources}
     cache.set(req.question, req.source_url, payload)
     return ChatResponse(**payload, cached=False)
@@ -97,34 +101,38 @@ def chat(req: ChatRequest) -> ChatResponse:
 def chat_stream(req: ChatRequest) -> StreamingResponse:
     """
     Server-Sent Events stream. Event protocol:
-      event: sources  -> JSON list of sources (sent first)
+      event: sources  -> JSON list of sources (sent first, always)
       event: token    -> one answer fragment (sent many times)
       event: done     -> end of stream
 
-    Cache behaviour:
-      - On cache HIT  : answer is replayed token-by-token from Redis (no Qdrant, no LLM)
-      - On cache MISS : full RAG pipeline runs, result saved to Redis for 24 hours
+    Two-layer cache behaviour:
+      Layer 1 HIT (exact question)     : replay from Redis, skip Qdrant+reranker+LLM
+      Layer 2 HIT (same chunk IDs)     : Qdrant+reranker run, LLM skipped (inside pipeline)
+      Both MISS                        : full pipeline runs, stored in both layers
     """
     pipe = get_pipeline()
 
     def event_generator():
         try:
-            # ── 1. CACHE HIT: serve answer from Redis ────────────────────────
+            # ── LAYER 1 CHECK: exact question → skip everything ───────────────
             cached = cache.get(req.question, req.source_url)
             if cached:
-                logger.info("Cache HIT for question: %s", req.question[:60])
+                logger.info("Layer 1 HIT (stream) for: %s", req.question[:60])
                 yield f"event: sources\ndata: {json.dumps(cached['sources'])}\n\n"
-                # Replay the full answer as a single token so the UI streams it.
                 yield f"event: token\ndata: {json.dumps(cached['answer'])}\n\n"
                 yield "event: done\ndata: {}\n\n"
                 return
 
-            # ── 2. CACHE MISS: run full RAG pipeline ─────────────────────────
-            logger.info("Cache MISS for question: %s", req.question[:60])
+            # ── LAYER 1 MISS: run pipeline ────────────────────────────────────
+            # Layer 2 check (chunk IDs) is handled inside answer_stream().
+            # If Layer 2 hits → token_iter yields one cached token, LLM skipped.
+            # If Layer 2 misses → token_iter streams live from LLM AND auto-stores in Layer 2.
+            logger.info("Layer 1 MISS (stream) for: %s", req.question[:60])
             token_iter, sources = pipe.answer_stream(
                 req.question, top_k=req.top_k, source_url=req.source_url
             )
-            # Send sources up front so the UI can show citations immediately.
+
+            # Sources sent first so UI shows citations while answer streams.
             yield f"event: sources\ndata: {json.dumps(sources)}\n\n"
 
             full = []
@@ -132,7 +140,8 @@ def chat_stream(req: ChatRequest) -> StreamingResponse:
                 full.append(token)
                 yield f"event: token\ndata: {json.dumps(token)}\n\n"
 
-            # Save assembled answer to Redis (expires in 24 hours).
+            # Store complete answer in Layer 1 (exact question cache).
+            # Layer 2 (chunk ID cache) was already stored inside pipeline.
             cache.set(
                 req.question, req.source_url,
                 {"answer": "".join(full), "sources": sources},
