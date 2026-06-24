@@ -16,6 +16,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from functools import lru_cache
 
+from app.cache import cache
 from app.config import settings
 from app.crawler import WebsiteCrawler
 from app.embeddings import Embedder
@@ -44,6 +45,21 @@ _REWRITE_SYSTEM = (
 )
 
 logger = logging.getLogger(__name__)
+
+# ── vague pronoun detection ───────────────────────────────────────────────────
+# Query rewriting only helps when the question has vague pronouns like "it",
+# "they", "this company". For direct questions ("what services does DotStark
+# offer?") rewriting wastes an entire LLM round trip (~400-800ms) for zero gain.
+# This regex guards the rewrite call — we skip it if no vague pronouns found.
+_VAGUE_RE = re.compile(
+    r"\b(it|they|them|their|theirs|this|that|the\s+company|the\s+team|the\s+firm)\b",
+    re.IGNORECASE,
+)
+
+# ── rewrite result cache (in-memory) ─────────────────────────────────────────
+# If the same vague question is asked twice, we skip the LLM rewrite call and
+# return the cached rewritten version instantly. Lives for the process lifetime.
+_rewrite_cache: dict[str, str] = {}
 
 # ── small-talk / greeting detection ──────────────────────────────────────────
 # If the user's message matches this pattern, we skip RAG retrieval entirely
@@ -144,17 +160,32 @@ class RAGPipeline:
 
         'when was it founded?' → 'When was DotStark founded?'
 
-        This fixes the pronoun resolution problem: vague pronouns like 'it',
-        'they', 'this company' produce generic embedding vectors that don't
-        match specific content in Qdrant. By replacing them with 'DotStark'
-        we get a precise vector that retrieves the right chunks.
+        SPEED OPTIMISATION — two guards to avoid wasting an LLM round trip:
 
-        We use a very low temperature (0.0) so the rewrite is deterministic.
-        If the LLM call fails for any reason, we fall back to the original.
+        Guard 1 — Vague pronoun check (saves ~400-800ms per request):
+          Only call the LLM if the question actually contains vague pronouns
+          like "it", "they", "this", "the company". Direct questions like
+          "What services does DotStark offer?" are returned immediately as-is.
+
+        Guard 2 — In-memory rewrite cache (saves repeated LLM calls):
+          If the same vague question is asked twice, we return the cached
+          rewrite instantly without hitting the Groq API again.
         """
-        # Skip rewriting for chitchat — it's handled separately anyway.
+        # Chitchat is handled separately — never rewrite it.
         if self._is_chitchat(question):
             return question
+
+        # Guard 1: skip rewrite entirely if no vague pronouns detected.
+        if not _VAGUE_RE.search(question):
+            logger.debug("Query rewrite skipped (no vague pronouns): '%s'", question[:60])
+            return question
+
+        # Guard 2: return cached rewrite if we've seen this question before.
+        if question in _rewrite_cache:
+            logger.debug("Query rewrite cache hit: '%s'", question[:60])
+            return _rewrite_cache[question]
+
+        # Only reach here for genuinely vague questions — call the LLM.
         try:
             messages = [
                 {"role": "system", "content": _REWRITE_SYSTEM},
@@ -163,7 +194,9 @@ class RAGPipeline:
             rewritten = self.llm.generate(messages, temperature=0.0).strip()
             if rewritten and rewritten != question:
                 logger.info("Query rewritten: '%s' → '%s'", question[:60], rewritten[:60])
-            return rewritten or question
+            result = rewritten or question
+            _rewrite_cache[question] = result  # cache for next time
+            return result
         except Exception as exc:
             logger.warning("Query rewrite failed (%s), using original.", exc)
             return question
@@ -204,6 +237,7 @@ class RAGPipeline:
             total_chunks += added
 
         self.retriever.invalidate_cache()
+        cache.increment_version()  # invalidate all Redis cached answers — Qdrant data changed
         return IngestResult(url=url, pages_crawled=len(pages), chunks_stored=total_chunks)
 
     # ── query ─────────────────────────────────────────────────────────────────

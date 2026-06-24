@@ -126,7 +126,12 @@ class Retriever:
           3. Rerank with the cross-encoder (if enabled) for final precision.
           4. Return the top_k.
         """
-        candidate_k = max(top_k * 4, 12)
+        # SPEED OPTIMISATION: reduced candidate pool from top_k*4 (20 chunks)
+        # to top_k*2 (10 chunks). The reranker cross-encoder scores each candidate
+        # on CPU — fewer candidates = fewer inference passes = faster response.
+        # Quality impact is minimal because hybrid search (BM25 + dense + RRF)
+        # already surfaces the best chunks before reranking.
+        candidate_k = max(top_k * 2, 8)
 
         dense = self._dense_search(query, candidate_k, source_url)
 
