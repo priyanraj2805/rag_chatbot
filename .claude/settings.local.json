@@ -22,7 +22,14 @@
       "Bash(./venv/Scripts/python.exe -m uvicorn app.main:app --port 8000 --log-level warning)",
       "Bash(echo \"exit:$?\")",
       "Bash(./venv/Scripts/python.exe -m py_compile app/crawler/crawler.py app/config.py app/main.py app/api/routes.py app/rag/pipeline.py)",
-      "Bash(git init *)"
+      "Bash(git init *)",
+      "Bash(git config *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git remote *)",
+      "Bash(git push *)",
+      "Bash(git checkout *)",
+      "Bash(git add *)",
+      "Bash(grep -o 'color:[^;]*\\\\|background[^;]*\\\\|#[0-9a-fA-F]\\\\{3,6\\\\}\\\\|rgb\\([^\\)]*\\)\\\\|rgba\\([^\\)]*\\)' \"C:\\\\Users\\\\priyanshuraj\\\\OneDrive\\\\Desktop\\\\dotstark\\\\chatbot_dotstark\\\\frontend\\\\public\\\\dotstark-homepage.html\")"
     ]
   }
 }

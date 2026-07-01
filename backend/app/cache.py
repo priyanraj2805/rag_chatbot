@@ -107,6 +107,18 @@ class AnswerCache:
         raw = f"v{version}|{question.strip().lower()}|{source_url or ''}|{chunks_part}"
         return "rag:llm:" + hashlib.sha256(raw.encode()).hexdigest()
 
+    def _semantic_key(self, chunk_ids: list[str], source_url: str | None) -> str:
+        """
+        SEMANTIC cache key — based ONLY on chunk IDs (no question text).
+        Different questions that retrieve the same chunks = same cache key.
+        This is true semantic caching: meaning-based, not text-based.
+        Prefix: rag:semantic:
+        """
+        version = self.get_version()
+        chunks_part = "|".join(sorted(chunk_ids))
+        raw = f"v{version}|{source_url or ''}|{chunks_part}"
+        return "rag:semantic:" + hashlib.sha256(raw.encode()).hexdigest()
+
     # ── LAYER 1: exact cache (question only) ──────────────────────────────────
 
     def get(self, question: str, source_url: str | None) -> dict | None:
@@ -179,6 +191,52 @@ class AnswerCache:
                 json.dumps(payload),
             )
             logger.debug("Layer 2 (LLM) cache SET for: %s", question[:60])
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ── LAYER 3: Semantic cache (chunk IDs only, no question text) ────────────
+
+    def get_semantic(
+        self,
+        chunk_ids: list[str],
+        source_url: str | None = None,
+    ) -> dict | None:
+        """
+        Semantic cache read — check AFTER Qdrant but BEFORE LLM.
+        Returns cached answer if these exact chunks were seen before,
+        regardless of how the question was phrased.
+        True semantic caching: meaning-based, not text-based.
+        """
+        if not self.client:
+            return None
+        try:
+            raw = self.client.get(self._semantic_key(chunk_ids, source_url))
+            if raw:
+                logger.info("Semantic cache HIT for chunks: %s", chunk_ids[:3])
+            return json.loads(raw) if raw else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def set_semantic(
+        self,
+        chunk_ids: list[str],
+        payload: dict,
+        source_url: str | None = None,
+    ) -> None:
+        """
+        Semantic cache write — store the LLM answer keyed only by chunk IDs.
+        Any future question that retrieves these same chunks will hit this cache,
+        even if the question wording is completely different.
+        """
+        if not self.client:
+            return
+        try:
+            self.client.setex(
+                self._semantic_key(chunk_ids, source_url),
+                _TTL_SECONDS,
+                json.dumps(payload),
+            )
+            logger.debug("Semantic cache SET for chunks: %s", chunk_ids[:3])
         except Exception:  # noqa: BLE001
             pass
 

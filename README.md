@@ -72,7 +72,7 @@ Get a **free** Groq API key at https://console.groq.com/keys and paste it into `
 ### 2. Run the API
 
 ```bash
-uvicorn app.main:app --reload --port 8000
+
 ```
 
 Open interactive docs at **http://localhost:8000/docs**.
@@ -93,7 +93,7 @@ Open **http://localhost:5173**. Enter a website URL, click **Ingest**, then chat
 ---
 
 ## 🧪 Quick test without the frontend
-
+uvicorn app.main:app --reload --port 8000
 ```bash
 cd backend
 source venv/Scripts/activate
