@@ -41,7 +41,7 @@ QUERY (online, every question)
 | LLM | `app/llm/` | prompt building + Groq/OpenAI client (streaming) |
 | Orchestrate | `app/rag/pipeline.py` | wires ingestion + query flows |
 | API | `app/api/routes.py`, `app/main.py` | FastAPI endpoints + SSE streaming |
-| Cache | `app/cache.py` | optional Redis answer cache |
+| Cache | `app/cache.py` | optional Redis three-layer answer cache (exact + LLM + semantic) |
 | UI | `frontend/` | React chat interface with citations |
 
 ---
@@ -72,7 +72,9 @@ Get a **free** Groq API key at https://console.groq.com/keys and paste it into `
 ### 2. Run the API
 
 ```bash
-
+cd backend
+source venv/Scripts/activate        # Git Bash on Windows
+uvicorn app.main:app --reload --port 8000
 ```
 
 Open interactive docs at **http://localhost:8000/docs**.
@@ -93,7 +95,7 @@ Open **http://localhost:5173**. Enter a website URL, click **Ingest**, then chat
 ---
 
 ## 🧪 Quick test without the frontend
-uvicorn app.main:app --reload --port 8000
+
 ```bash
 cd backend
 source venv/Scripts/activate
@@ -142,7 +144,11 @@ python tests/test_processing.py
 - **Metadata filtering** — restrict retrieval to one `source_url`.
 - **Streaming responses** — token-by-token via Server-Sent Events.
 - **Source citations** — every answer cites `[n]` linking to the source page.
-- **Redis cache** — optional; identical questions return instantly.
+- **Three-layer Redis cache** — optional; gracefully disabled when Redis is absent.
+  - **Layer 1 (exact)** — same question asked again? Skip Qdrant + reranker + LLM entirely (~50ms).
+  - **Layer 2 (LLM)** — same question retrieves same chunks? Skip only the LLM (~400ms saved).
+  - **Layer 3 (semantic)** — different question but same chunks retrieved? Reuse the cached answer regardless of wording.
+  - **Version-based invalidation** — every ingest bumps a Redis counter; all cached answers invalidate instantly.
 
 ---
 
